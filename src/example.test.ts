@@ -1,22 +1,74 @@
-import { Entity, MikroORM, PrimaryKey, Property } from '@mikro-orm/sqlite';
+import { Collection, Entity, ManyToMany, MikroORM, OneToOne, PrimaryKey, Property, Ref } from '@mikro-orm/sqlite';
 
 @Entity()
-class User {
+class Tag {
+    @PrimaryKey()
+    id!: number;
 
-  @PrimaryKey()
-  id!: number;
+    @Property()
+    name!: string;
+}
 
-  @Property()
-  name: string;
+@Entity()
+class Questions {
+    @PrimaryKey()
+    id!: number;
 
-  @Property({ unique: true })
-  email: string;
+    @Property()
+    text!: string;
 
-  constructor(name: string, email: string) {
-    this.name = name;
-    this.email = email;
-  }
+    @Property()
+    answer!: string;
 
+    @ManyToMany({
+        entity: () => Tag,
+        pivotTable: 'question_tags',
+        joinColumn: 'question_id',
+        inverseJoinColumn: 'tag_id',
+    })
+    tags = new Collection<Tag>(this);
+}
+
+@Entity()
+class ReferenceMaterials {
+    @PrimaryKey()
+    id!: number;
+
+    @Property()
+    text!: string;
+
+    @ManyToMany({
+        entity: () => Tag,
+        pivotTable: 'reference_material_tags',
+        joinColumn: 'reference_material_id',
+        inverseJoinColumn: 'tag_id',
+    })
+    tags = new Collection<Tag>(this);
+}
+
+@Entity({
+    expression: `SELECT
+            id as question_id,
+            NULL as reference_material_id,
+            CONCAT('questions-', id) as id
+            FROM questions
+            UNION ALL
+            SELECT
+            NULL as question_id,
+            id as reference_material_id,
+            CONCAT('reference_materials-', id) as id
+            FROM reference_materials`
+    ,
+})
+class SearchResults {
+    @Property({ type: 'text' })
+    id!: string;
+
+    @OneToOne({ entity: () => Questions, joinColumn: 'question_id', nullable: true, ref: true })
+    question?: Ref<Questions>;
+
+    @OneToOne({ entity: () => ReferenceMaterials, joinColumn: 'reference_material_id', nullable: true, ref: true })
+    referenceMaterial?: Ref<ReferenceMaterials>;
 }
 
 let orm: MikroORM;
@@ -24,7 +76,7 @@ let orm: MikroORM;
 beforeAll(async () => {
   orm = await MikroORM.init({
     dbName: ':memory:',
-    entities: [User],
+    entities: [Tag, Questions, ReferenceMaterials, SearchResults],
     debug: ['query', 'query-params'],
     allowGlobalContext: true, // only for testing
   });
@@ -35,17 +87,65 @@ afterAll(async () => {
   await orm.close(true);
 });
 
-test('basic CRUD example', async () => {
-  orm.em.create(User, { name: 'Foo', email: 'foo' });
-  await orm.em.flush();
-  orm.em.clear();
+test('virtual entity: filtering through nested ManyToMany works when no limit applied', async () => {
+    const em = orm.em.fork();
 
-  const user = await orm.em.findOneOrFail(User, { email: 'foo' });
-  expect(user.name).toBe('Foo');
-  user.name = 'Bar';
-  orm.em.remove(user);
-  await orm.em.flush();
+    const tag = em.create(Tag, { name: 'geography' });
+    const question = em.create(Questions, { text: 'What is the capital of France?', answer: 'Paris' });
+    const referenceMaterial = em.create(ReferenceMaterials, { text: 'France is a country in Europe.' });
 
-  const count = await orm.em.count(User, { email: 'foo' });
-  expect(count).toBe(0);
+    question.tags.add(tag);
+    referenceMaterial.tags.add(tag);
+
+    await em.flush();
+    const [results, count] = await em.fork().findAndCount(
+        SearchResults,
+        {
+            $or: [
+                { question: { tags: { name: 'geography' } } },
+                { referenceMaterial: { tags: { name: 'geography' } } },
+            ],
+        },
+        {
+            populate: ['question', 'referenceMaterial', 'question.tags', 'referenceMaterial.tags'],
+        }
+    );
+
+    expect(results).toHaveLength(2);
+    expect(count).toBe(2);
+});
+
+test('virtual entity: filtering through nested ManyToMany produces empty column identifier', async () => {
+    const em = orm.em.fork();
+
+    const tag = em.create(Tag, { name: 'geography' });
+    const question = em.create(Questions, { text: 'What is the capital of France?', answer: 'Paris' });
+    const referenceMaterial = em.create(ReferenceMaterials, { text: 'France is a country in Europe.' });
+
+    question.tags.add(tag);
+    referenceMaterial.tags.add(tag);
+
+    await em.flush();
+
+    // Query the virtual entity, filtering through OneToOne -> ManyToMany relationships.
+    // No formula-based relationships are involved — all joins are standard.
+    //
+    // Expected: MikroORM resolves the virtual entity's `id` column for subquery correlation
+    // Actual: Produces WHERE "s0"."" IN (...) — empty column identifier
+    const [results, count] = await em.fork().findAndCount(
+        SearchResults,
+        {
+            $or: [
+                { question: { tags: { name: 'geography' } } },
+                { referenceMaterial: { tags: { name: 'geography' } } },
+            ],
+        },
+        {
+            limit: 10,
+            populate: ['question', 'referenceMaterial', 'question.tags', 'referenceMaterial.tags'],
+        }
+    );
+
+    expect(results).toHaveLength(2);
+    expect(count).toBe(2);
 });
