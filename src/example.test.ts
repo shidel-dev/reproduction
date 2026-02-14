@@ -17,6 +17,9 @@ class Folder {
     @Property()
     name!: string;
 
+    @Property({persist: false})
+    ownerId!: number & Opt;
+
     @ManyToOne(() => Owner)
     owner!: Ref<Owner>;
 }
